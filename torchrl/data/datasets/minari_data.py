@@ -45,6 +45,12 @@ _DTYPE_DIR = {
     "int64": torch.int64,
     "int32": torch.int32,
     "uint8": torch.uint8,
+    "torch.float16": torch.float16,
+    "torch.float32": torch.float32,
+    "torch.float64": torch.float64,
+    "torch.int64": torch.int64,
+    "torch.int32": torch.int32,
+    "torch.uint8": torch.uint8
 }
 
 
@@ -88,25 +94,24 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
             it is assumed that any ``truncated`` or ``terminated`` signal is
             equivalent to the end of a trajectory.
             Defaults to ``False``.
+        string_to_tensor_map (dict[str, Callable[[str], Tensor]]): Optional mapping from a string key path
+            (e.g., 'observations/mission') to a function that converts unsupported NonTensorData to a tensor.
+            This allows customization of how string-based fields (e.g., language missions)
+            are encoded during dataset writing.
 
     Attributes:
         available_datasets: a list of accepted entries to be downloaded.
 
-    .. note::
-      Text data is currenrtly discarded from the wrapped dataset, as there is not
-      PyTorch native way of representing text data.
-      If this feature is required, please post an issue on TorchRL's GitHub
-      repository.
-
     Examples:
         >>> from torchrl.data.datasets.minari_data import MinariExperienceReplay
-        >>> data = MinariExperienceReplay("door-human-v1", batch_size=32, download="force")
+        >>> data = MinariExperienceReplay("D4RL/door/human-v2", batch_size=32, download="force")
         >>> for sample in data:
         ...     torchrl_logger.info(sample)
         ...     break
         TensorDict(
             fields={
                 action: Tensor(shape=torch.Size([32, 28]), device=cpu, dtype=torch.float32, is_shared=False),
+                episode: Tensor(shape=torch.Size([32]), device=cpu, dtype=torch.int64, is_shared=False),
                 index: Tensor(shape=torch.Size([32]), device=cpu, dtype=torch.int64, is_shared=False),
                 info: TensorDict(
                     fields={
@@ -125,28 +130,12 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
                             is_shared=False),
                         observation: Tensor(shape=torch.Size([32, 39]), device=cpu, dtype=torch.float64, is_shared=False),
                         reward: Tensor(shape=torch.Size([32, 1]), device=cpu, dtype=torch.float64, is_shared=False),
-                        state: TensorDict(
-                            fields={
-                                door_body_pos: Tensor(shape=torch.Size([32, 3]), device=cpu, dtype=torch.float64, is_shared=False),
-                                qpos: Tensor(shape=torch.Size([32, 30]), device=cpu, dtype=torch.float64, is_shared=False),
-                                qvel: Tensor(shape=torch.Size([32, 30]), device=cpu, dtype=torch.float64, is_shared=False)},
-                            batch_size=torch.Size([32]),
-                            device=cpu,
-                            is_shared=False),
                         terminated: Tensor(shape=torch.Size([32, 1]), device=cpu, dtype=torch.bool, is_shared=False),
                         truncated: Tensor(shape=torch.Size([32, 1]), device=cpu, dtype=torch.bool, is_shared=False)},
                     batch_size=torch.Size([32]),
                     device=cpu,
                     is_shared=False),
-                observation: Tensor(shape=torch.Size([32, 39]), device=cpu, dtype=torch.float64, is_shared=False),
-                state: TensorDict(
-                    fields={
-                        door_body_pos: Tensor(shape=torch.Size([32, 3]), device=cpu, dtype=torch.float64, is_shared=False),
-                        qpos: Tensor(shape=torch.Size([32, 30]), device=cpu, dtype=torch.float64, is_shared=False),
-                        qvel: Tensor(shape=torch.Size([32, 30]), device=cpu, dtype=torch.float64, is_shared=False)},
-                    batch_size=torch.Size([32]),
-                    device=cpu,
-                    is_shared=False)},
+                observation: Tensor(shape=torch.Size([32, 39]), device=cpu, dtype=torch.float64, is_shared=False)},
             batch_size=torch.Size([32]),
             device=cpu,
             is_shared=False)
@@ -159,7 +148,7 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
         batch_size: int,
         *,
         root: str | Path | None = None,
-        download: bool = True,
+        download: bool | str = True,
         sampler: Sampler | None = None,
         writer: Writer | None = None,
         collate_fn: Callable | None = None,
@@ -167,6 +156,7 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
         prefetch: int | None = None,
         transform: torchrl.envs.Transform | None = None,  # noqa-F821
         split_trajs: bool = False,
+        string_to_tensor_map: dict[str, Callable[[any], torch.Tensor]] | None = None
     ):
         self.dataset_id = dataset_id
         if root is None:
@@ -175,6 +165,7 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
         self.root = root
         self.split_trajs = split_trajs
         self.download = download
+        self._string_to_tensor_map = string_to_tensor_map or {}
         if self.download == "force" or (self.download and not self._is_downloaded()):
             if self.download == "force":
                 try:
@@ -243,49 +234,64 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
             minari.download_dataset(dataset_id=self.dataset_id)
             parent_dir = Path(tmpdir) / self.dataset_id / "data"
 
-            td_data = TensorDict()
+            td_data = TensorDict({}, batch_size=[])
             total_steps = 0
             torchrl_logger.info("first read through data to create data structure...")
-            h5_data = PersistentTensorDict.from_h5(parent_dir / "main_data.hdf5")
+            h5_data = PersistentTensorDict.from_h5(str(parent_dir / "main_data.hdf5"))
             # populate the tensordict
             episode_dict = {}
-            for i, (episode_key, episode) in enumerate(h5_data.items()):
-                episode_num = int(episode_key[len("episode_") :])
+            for episode_key, episode in h5_data.items():
+                episode_num = int(episode_key[len("episode_"):])
                 episode_len = episode["actions"].shape[0]
                 episode_dict[episode_num] = (episode_key, episode_len)
                 # Get the total number of steps for the dataset
                 total_steps += episode_len
-                if i == 0:
-                    td_data.set("episode", 0)
-                    for key, val in episode.items():
-                        match = _NAME_MATCH[key]
-                        if key in ("observations", "state", "infos"):
-                            if (
-                                not val.shape
-                            ):  # no need for this, we don't need the proper length: or steps != val.shape[0] - 1:
-                                if val.is_empty():
-                                    continue
-                                val = _patch_info(val)
-                            td_data.set(("next", match), torch.zeros_like(val[0]))
-                            td_data.set(match, torch.zeros_like(val[0]))
-                        if key not in ("terminations", "truncations", "rewards"):
-                            td_data.set(match, torch.zeros_like(val[0]))
-                        else:
-                            td_data.set(
-                                ("next", match),
-                                torch.zeros_like(val[0].unsqueeze(-1)),
-                            )
 
-            # give it the proper size
+            # Use first episode to allocate structure
+            ref_episode = h5_data.get(episode_dict[0][0])
+
+            td_data.set("episode", torch.zeros((total_steps,), dtype=torch.int64))
+
+            field_max_tracker = {}
+
+            for key, val in ref_episode.items():
+                match = _NAME_MATCH[key]
+
+                if key == "observations":
+                    for subkey, subval in val.items():
+                        path_key = f"{key}/{subkey}"
+                        if path_key in self._string_to_tensor_map:
+                            encoded = self._string_to_tensor_map[path_key](subval.data[0])
+                            shape = (total_steps, *encoded.shape)
+                            td_data.set(("observation", subkey), torch.zeros(shape, dtype=encoded.dtype))
+                            td_data.set(("next", "observation", subkey), torch.zeros(shape, dtype=encoded.dtype))
+                        else:
+                            shape = (total_steps,) if subval.dim() == 1 else (total_steps, *subval[0].shape)
+                            td_data.set(("observation", subkey), torch.zeros(shape, dtype=subval.dtype))
+                            td_data.set(("next", "observation", subkey), torch.zeros(shape, dtype=subval.dtype))
+
+                elif key in ("terminations", "truncations", "rewards"):
+                    td_data.set(("next", match), torch.zeros((total_steps, 1), dtype=val.dtype))
+
+                else:
+                    shape = (total_steps,) if val.dim() == 1 else (total_steps, *val[0].shape)
+                    td_data.set((match,), torch.zeros(shape, dtype=val.dtype))
+                    if key in ("state", "infos"):
+                        td_data.set(("next", match), torch.zeros(shape, dtype=val.dtype))
+
+            # Set batch size
+            td_data.batch_size = [total_steps]
+
+            # Set 'done' placeholder
             td_data["next", "done"] = (
-                td_data["next", "truncated"] | td_data["next", "terminated"]
+                    td_data["next", "truncated"] | td_data["next", "terminated"]
             )
             if "terminated" in td_data.keys():
                 td_data["done"] = td_data["truncated"] | td_data["terminated"]
-            td_data = td_data.expand(total_steps)
+
             # save to designated location
             torchrl_logger.info(f"creating tensordict data in {self.data_path_root}: ")
-            td_data = td_data.memmap_like(self.data_path_root)
+            td_data = td_data.memmap_like(str(self.data_path_root))
             torchrl_logger.info(f"tensordict structure: {td_data}")
 
             torchrl_logger.info(f"Reading data from {max(*episode_dict) + 1} episodes")
@@ -300,11 +306,31 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
                     data_view.fill_("episode", episode_num)
                     for key, val in episode.items():
                         match = _NAME_MATCH[key]
-                        if key in (
-                            "observations",
-                            "state",
-                            "infos",
-                        ):
+                        if key == "observations":
+                            for subkey, subval in val.items():
+                                path_key = f"{key}/{subkey}"
+                                if path_key in self._string_to_tensor_map:
+                                    encoder = self._string_to_tensor_map[path_key]
+                                    try:
+                                        encoded = [encoder(s) for s in subval.data[:-1]]
+                                        next_encoded = [encoder(s) for s in subval.data[1:]]
+                                    except Exception as e:
+                                        raise RuntimeError(
+                                            f"Failed to encode string at {path_key}: {e}"
+                                        ) from e
+                                    combined = torch.stack(encoded + next_encoded).flatten()
+                                    if combined.dtype in (torch.int64, torch.int32, torch.uint8):
+                                        max_val = combined.max().item()
+                                        field_max_tracker[path_key] = max(
+                                            max_val, field_max_tracker.get(path_key, 0)
+                                        )
+                                    data_view["observation", subkey].copy_(torch.stack(encoded))
+                                    data_view["next", "observation", subkey].copy_(torch.stack(next_encoded))
+                                else:
+                                    data_view["observation", subkey].copy_(subval[:-1])
+                                    data_view["next", "observation", subkey].copy_(subval[1:])
+
+                        elif key in ("state", "infos"):
                             if not val.shape or steps != val.shape[0] - 1:
                                 if val.is_empty():
                                     continue
@@ -315,24 +341,21 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
                                 )
                             data_view["next", match].copy_(val[1:])
                             data_view[match].copy_(val[:-1])
-                        elif key not in ("terminations", "truncations", "rewards"):
-                            if steps is None:
-                                steps = val.shape[0]
-                            else:
-                                if steps != val.shape[0]:
-                                    raise RuntimeError(
-                                        f"Mismatching number of steps for key {key}: was {steps} but got {val.shape[0]}."
-                                    )
-                            data_view[match].copy_(val)
+
+                        elif key in ("terminations", "truncations", "rewards"):
+                            if steps != val.shape[0]:
+                                raise RuntimeError(
+                                    f"Mismatching number of steps for key {key}: was {steps} but got {val.shape[0]}."
+                                )
+                            data_view["next", match].copy_(val.unsqueeze(-1))
+
                         else:
-                            if steps is None:
-                                steps = val.shape[0]
-                            else:
-                                if steps != val.shape[0]:
-                                    raise RuntimeError(
-                                        f"Mismatching number of steps for key {key}: was {steps} but got {val.shape[0]}."
-                                    )
-                            data_view[("next", match)].copy_(val.unsqueeze(-1))
+                            if steps != val.shape[0]:
+                                raise RuntimeError(
+                                    f"Mismatching number of steps for key {key}: was {steps} but got {val.shape[0]}."
+                                )
+                            data_view[match].copy_(val)
+
                     data_view["next", "done"].copy_(
                         data_view["next", "terminated"] | data_view["next", "truncated"]
                     )
@@ -346,19 +369,48 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
                             f"index={index} - episode num {episode_num}"
                         )
                     index += steps
+
+            # Extract real encoder input examples before closing h5_data
+            sampled_values = {}
+            for path_key in self._string_to_tensor_map:
+                if path_key.startswith("observations/"):
+                    field = path_key.split("/", 1)[1]
+                    try:
+                        # Use the first episode
+                        episode_key = episode_dict[0][0]
+                        subval = h5_data.get(episode_key)["observations"][field]
+                        sampled_values[path_key] = subval[0]  # eager copy
+                    except Exception as e:
+                        torchrl_logger.warning(f"Could not extract value for {path_key}: {e}")
+
             h5_data.close()
             # Add a "done" entry
             if self.split_trajs:
                 with td_data.unlock_():
                     from torchrl.collectors.utils import split_trajectories
+                    td_data = split_trajectories(td_data).memmap_(str(self.data_path))
 
-                    td_data = split_trajectories(td_data).memmap_(self.data_path)
             with open(self.metadata_path, "w") as metadata_file:
                 dataset = minari.load_dataset(self.dataset_id)
                 self.metadata = asdict(dataset.spec)
-                self.metadata["observation_space"] = _spec_to_dict(
-                    self.metadata["observation_space"]
-                )
+
+                obs_space = _spec_to_dict(self.metadata["observation_space"])
+                if "subspaces" in obs_space:
+                    for path_key, encoder in self._string_to_tensor_map.items():
+                        if path_key.startswith("observations/"):
+                            field = path_key.split("/", 1)[1]
+                            try:
+                                example_value = sampled_values[path_key]
+                                example_tensor = encoder(example_value)
+                                max_val = field_max_tracker.get(path_key, None)
+                                obs_space["subspaces"][field] = self._tensor_to_spec_dict(example_tensor,
+                                                                                          max_value=max_val)
+                            except Exception as e:
+                                torchrl_logger.warning(
+                                    f"Could not encode observation field '{field}' for metadata: {e}"
+                                )
+
+                self.metadata["observation_space"] = obs_space
                 self.metadata["action_space"] = _spec_to_dict(
                     self.metadata["action_space"]
                 )
@@ -366,12 +418,34 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
             self._load_and_proc_metadata()
             return td_data
 
+    @staticmethod
+    def _tensor_to_spec_dict(tensor: torch.Tensor, max_value: int | None = None) -> dict:
+        if tensor.dtype in (torch.float32, torch.float64, torch.float16):
+            return {
+                "type": "Box",
+                "low": [-float("inf")] * tensor.numel(),
+                "high": [float("inf")] * tensor.numel(),
+                "dtype": str(tensor.dtype),
+                "shape": list(tensor.shape),
+            }
+        elif tensor.dtype in (torch.uint8, torch.int64, torch.int32):
+            if max_value is None:
+                raise ValueError("max_value must be provided for Discrete tensors.")
+            return {
+                "type": "Discrete",
+                "dtype": str(tensor.dtype),
+                "n": int(max_value) + 1,
+                "shape": list(tensor.shape),
+            }
+        else:
+            raise TypeError(f"Unsupported dtype {tensor.dtype} for spec conversion.")
+
     def _make_split(self):
         from torchrl.collectors.utils import split_trajectories
 
         self._load_and_proc_metadata()
         td_data = TensorDict.load_memmap(self.data_path_root)
-        td_data = split_trajectories(td_data).memmap_(self.data_path)
+        td_data = split_trajectories(td_data).memmap_(str(self.data_path))
         return td_data
 
     def _load(self):
