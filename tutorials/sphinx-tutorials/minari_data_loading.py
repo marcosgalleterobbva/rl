@@ -27,9 +27,9 @@ def main():
     data = MinariExperienceReplay(
         dataset_id="minigrid/BabyAI-Pickup/optimal-v0",
         batch_size=1,
-        download="force",  # uncomment if you want to force redownload
+        download="force",
         string_to_tensor_map={
-            "observations/mission": encode_mission_string  # ✅ map mission to one-hot
+            "observations/mission": encode_mission_string
         }
     )
 
