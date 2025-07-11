@@ -250,7 +250,7 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
             # Use first episode to allocate structure
             ref_episode = h5_data.get(episode_dict[0][0])
 
-            td_data.set("episode", torch.zeros((total_steps,), dtype=torch.int64))
+            td_data.set("episode", 0)
 
             field_max_tracker = {}
 
@@ -262,33 +262,29 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
                         path_key = f"{key}/{subkey}"
                         if path_key in self._string_to_tensor_map:
                             encoded = self._string_to_tensor_map[path_key](subval.data[0])
-                            shape = (total_steps, *encoded.shape)
+                            shape = encoded.shape
                             td_data.set(("observation", subkey), torch.zeros(shape, dtype=encoded.dtype))
                             td_data.set(("next", "observation", subkey), torch.zeros(shape, dtype=encoded.dtype))
                         else:
-                            shape = (total_steps,) if subval.dim() == 1 else (total_steps, *subval[0].shape)
-                            td_data.set(("observation", subkey), torch.zeros(shape, dtype=subval.dtype))
-                            td_data.set(("next", "observation", subkey), torch.zeros(shape, dtype=subval.dtype))
+                            td_data.set(("observation", subkey), torch.zeros_like(subval[0]))
+                            td_data.set(("next", "observation", subkey), torch.zeros_like(subval[0]))
 
                 elif key in ("terminations", "truncations", "rewards"):
-                    td_data.set(("next", match), torch.zeros((total_steps, 1), dtype=val.dtype))
+                    td_data.set(("next", match), torch.zeros_like(val[0].unsqueeze(-1)))
 
                 else:
-                    shape = (total_steps,) if val.dim() == 1 else (total_steps, *val[0].shape)
-                    td_data.set((match,), torch.zeros(shape, dtype=val.dtype))
+                    td_data.set(match, torch.zeros_like(val[0]))
+
                     if key in ("state", "infos"):
-                        td_data.set(("next", match), torch.zeros(shape, dtype=val.dtype))
+                        td_data.set(("next", match), torch.zeros_like(val[0]))
 
-            # Set batch size
-            td_data.batch_size = [total_steps]
-
-            # Set 'done' placeholder
+            # give it the proper size
             td_data["next", "done"] = (
                     td_data["next", "truncated"] | td_data["next", "terminated"]
             )
             if "terminated" in td_data.keys():
                 td_data["done"] = td_data["truncated"] | td_data["terminated"]
-
+            td_data = td_data.expand(total_steps)
             # save to designated location
             torchrl_logger.info(f"creating tensordict data in {self.data_path_root}: ")
             td_data = td_data.memmap_like(str(self.data_path_root))
