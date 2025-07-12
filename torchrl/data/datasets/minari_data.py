@@ -258,16 +258,22 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
                 match = _NAME_MATCH[key]
 
                 if key == "observations":
-                    for subkey, subval in val.items():
-                        path_key = f"{key}/{subkey}"
-                        if path_key in self._string_to_tensor_map:
-                            encoded = self._string_to_tensor_map[path_key](subval.data[0])
-                            shape = encoded.shape
-                            td_data.set(("observation", subkey), torch.zeros(shape, dtype=encoded.dtype))
-                            td_data.set(("next", "observation", subkey), torch.zeros(shape, dtype=encoded.dtype))
-                        else:
-                            td_data.set(("observation", subkey), torch.zeros_like(subval[0]))
-                            td_data.set(("next", "observation", subkey), torch.zeros_like(subval[0]))
+                    if isinstance(val, PersistentTensorDict):
+                        for subkey, subval in val.items():
+                            path_key = f"{key}/{subkey}"
+                            if path_key in self._string_to_tensor_map:
+                                encoded = self._string_to_tensor_map[path_key](subval.data[0])
+                                shape = encoded.shape
+                                td_data.set(("observation", subkey), torch.zeros(shape, dtype=encoded.dtype))
+                                td_data.set(("next", "observation", subkey), torch.zeros(shape, dtype=encoded.dtype))
+                            else:
+                                td_data.set(("observation", subkey), torch.zeros_like(subval[0]))
+                                td_data.set(("next", "observation", subkey), torch.zeros_like(subval[0]))
+                    elif isinstance(val, torch.Tensor):
+                        td_data.set(("next", match), torch.zeros_like(val[0]))
+                        td_data.set(match, torch.zeros_like(val[0]))
+                    else:
+                        raise Exception("Unexpected data type in observation.")
 
                 elif key in ("terminations", "truncations", "rewards"):
                     td_data.set(("next", match), torch.zeros_like(val[0].unsqueeze(-1)))
@@ -303,28 +309,36 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
                     for key, val in episode.items():
                         match = _NAME_MATCH[key]
                         if key == "observations":
-                            for subkey, subval in val.items():
-                                path_key = f"{key}/{subkey}"
-                                if path_key in self._string_to_tensor_map:
-                                    encoder = self._string_to_tensor_map[path_key]
-                                    try:
-                                        encoded = [encoder(s) for s in subval.data[:-1]]
-                                        next_encoded = [encoder(s) for s in subval.data[1:]]
-                                    except Exception as e:
-                                        raise RuntimeError(
-                                            f"Failed to encode string at {path_key}: {e}"
-                                        ) from e
-                                    combined = torch.stack(encoded + next_encoded).flatten()
-                                    if combined.dtype in (torch.int64, torch.int32, torch.uint8):
-                                        max_val = combined.max().item()
-                                        field_max_tracker[path_key] = max(
-                                            max_val, field_max_tracker.get(path_key, 0)
-                                        )
-                                    data_view["observation", subkey].copy_(torch.stack(encoded))
-                                    data_view["next", "observation", subkey].copy_(torch.stack(next_encoded))
-                                else:
-                                    data_view["observation", subkey].copy_(subval[:-1])
-                                    data_view["next", "observation", subkey].copy_(subval[1:])
+                            if isinstance(val, PersistentTensorDict):
+                                for subkey, subval in val.items():
+                                    path_key = f"{key}/{subkey}"
+                                    if path_key in self._string_to_tensor_map:
+                                        encoder = self._string_to_tensor_map[path_key]
+                                        try:
+                                            encoded = [encoder(s) for s in subval.data[:-1]]
+                                            next_encoded = [encoder(s) for s in subval.data[1:]]
+                                        except Exception as e:
+                                            raise RuntimeError(
+                                                f"Failed to encode string at {path_key}: {e}"
+                                            ) from e
+                                        combined = torch.stack(encoded + next_encoded).flatten()
+                                        if combined.dtype in (torch.int64, torch.int32, torch.uint8):
+                                            max_val = combined.max().item()
+                                            field_max_tracker[path_key] = max(
+                                                max_val, field_max_tracker.get(path_key, 0)
+                                            )
+                                        data_view["observation", subkey].copy_(torch.stack(encoded))
+                                        data_view["next", "observation", subkey].copy_(torch.stack(next_encoded))
+                                    else:
+                                        data_view["observation", subkey].copy_(subval[:-1])
+                                        data_view["next", "observation", subkey].copy_(subval[1:])
+                            elif isinstance(val, torch.Tensor):
+                                if steps != val.shape[0] - 1:
+                                    raise RuntimeError(
+                                        f"Mismatching number of steps for key {key}: was {steps} but got {val.shape[0] - 1}."
+                                    )
+                                data_view["next", match].copy_(val[1:])
+                                data_view[match].copy_(val[:-1])
 
                         elif key in ("state", "infos"):
                             if not val.shape or steps != val.shape[0] - 1:
