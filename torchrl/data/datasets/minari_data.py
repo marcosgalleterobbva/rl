@@ -286,7 +286,7 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
 
             # give it the proper size
             td_data["next", "done"] = (
-                    td_data["next", "truncated"] | td_data["next", "terminated"]
+                td_data["next", "truncated"] | td_data["next", "terminated"]
             )
             if "terminated" in td_data.keys():
                 td_data["done"] = td_data["truncated"] | td_data["terminated"]
@@ -308,6 +308,15 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
                     data_view.fill_("episode", episode_num)
                     for key, val in episode.items():
                         match = _NAME_MATCH[key]
+                        if key in ("observations", "state", "infos"):
+                            if not val.shape or steps != val.shape[0] - 1:
+                                if val.is_empty():
+                                    continue
+                                val = _patch_info(val)
+                            if steps != val.shape[0] - 1:
+                                raise RuntimeError(
+                                    f"Mismatching number of steps for key {key}: was {steps} but got {val.shape[0] - 1}."
+                                )
                         if key == "observations":
                             if isinstance(val, PersistentTensorDict):
                                 for subkey, subval in val.items():
@@ -330,8 +339,32 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
                                         data_view["observation", subkey].copy_(torch.stack(encoded))
                                         data_view["next", "observation", subkey].copy_(torch.stack(next_encoded))
                                     else:
-                                        data_view["observation", subkey].copy_(subval[:-1])
-                                        data_view["next", "observation", subkey].copy_(subval[1:])
+                                        if isinstance(data_view["observation", subkey], TensorDict):
+                                            data_view["observation"].copy_({subkey: subval[:-1]})
+                                            data_view["next", "observation"].copy_({subkey: subval[1:]})
+                                        elif isinstance(data_view["observation", subkey], list):
+                                            # TODO: Unfortunately the copy_ method fais when dealing with
+                                            #       subvals of NonTensorData. It fails with this
+                                            #       RuntimeError: Cannot update a leaf NonTensorDataBase from a memmaped
+                                            #       parent NonTensorStack. To update this leaf node, please update the
+                                            #       NonTensorStack with the proper index.
+                                            #       Unfortunately, this following method also fails, as lists do not
+                                            #       have copy_ method
+                                            #           data_view["observation", subkey].copy_(subval[:-1])
+                                            #       The only approach that seems to be working it unlocking the
+                                            #       Tensordict. I would prefer something like the following:
+                                            #           for i in range(len(subval) - 1):
+                                            #               data_view[i].set(("observation", subkey), subval[i])
+                                            #               data_view[i].set(("next", "observation", subkey), subval[i + 1])
+                                            #       But this three previous lines give this error:
+                                            #           RuntimeError: Cannot modify locked TensorDict. For in-place
+                                            #           modification, consider using the `set_()` method and make
+                                            #           sure the key is present.
+                                            #       But this current approach takes incredibly long to complete, maybe
+                                            #       I should do something different?
+                                            with data_view.unlock_():
+                                                data_view.set(("observation", subkey), subval[:-1])
+
                             elif isinstance(val, torch.Tensor):
                                 if steps != val.shape[0] - 1:
                                     raise RuntimeError(
