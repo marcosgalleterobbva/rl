@@ -50,7 +50,7 @@ _DTYPE_DIR = {
     "torch.float64": torch.float64,
     "torch.int64": torch.int64,
     "torch.int32": torch.int32,
-    "torch.uint8": torch.uint8
+    "torch.uint8": torch.uint8,
 }
 
 
@@ -156,7 +156,7 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
         prefetch: int | None = None,
         transform: torchrl.envs.Transform | None = None,  # noqa-F821
         split_trajs: bool = False,
-        string_to_tensor_map: dict[str, Callable[[any], torch.Tensor]] | None = None
+        string_to_tensor_map: dict[str, Callable[[any], torch.Tensor]] | None = None,
     ):
         self.dataset_id = dataset_id
         if root is None:
@@ -241,7 +241,7 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
             # populate the tensordict
             episode_dict = {}
             for episode_key, episode in h5_data.items():
-                episode_num = int(episode_key[len("episode_"):])
+                episode_num = int(episode_key[len("episode_") :])
                 episode_len = episode["actions"].shape[0]
                 episode_dict[episode_num] = (episode_key, episode_len)
                 # Get the total number of steps for the dataset
@@ -257,9 +257,7 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
             for key, val in ref_episode.items():
                 match = _NAME_MATCH[key]
                 if key in ("observations", "state", "infos"):
-                    if (
-                            not val.shape
-                    ):  # no need for this, we don't need the proper length: or steps != val.shape[0] - 1:
+                    if not val.shape:
                         if val.is_empty():
                             continue
                         val = _patch_info(val)
@@ -268,13 +266,26 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
                         for subkey, subval in val.items():
                             path_key = f"{key}/{subkey}"
                             if path_key in self._string_to_tensor_map:
-                                encoded = self._string_to_tensor_map[path_key](subval.data[0])
+                                encoded = self._string_to_tensor_map[path_key](
+                                    subval.data[0]
+                                )
                                 shape = encoded.shape
-                                td_data.set(("observation", subkey), torch.zeros(shape, dtype=encoded.dtype))
-                                td_data.set(("next", "observation", subkey), torch.zeros(shape, dtype=encoded.dtype))
+                                td_data.set(
+                                    ("observation", subkey),
+                                    torch.zeros(shape, dtype=encoded.dtype),
+                                )
+                                td_data.set(
+                                    ("next", "observation", subkey),
+                                    torch.zeros(shape, dtype=encoded.dtype),
+                                )
                             else:
-                                td_data.set(("observation", subkey), torch.zeros_like(subval[0]))
-                                td_data.set(("next", "observation", subkey), torch.zeros_like(subval[0]))
+                                td_data.set(
+                                    ("observation", subkey), torch.zeros_like(subval[0])
+                                )
+                                td_data.set(
+                                    ("next", "observation", subkey),
+                                    torch.zeros_like(subval[0]),
+                                )
                     elif isinstance(val, torch.Tensor):
                         td_data.set(("next", match), torch.zeros_like(val[0]))
                         td_data.set(match, torch.zeros_like(val[0]))
@@ -330,25 +341,48 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
                                     if path_key in self._string_to_tensor_map:
                                         encoder = self._string_to_tensor_map[path_key]
                                         try:
-                                            encoded = [encoder(s) for s in subval.data[:-1]]
-                                            next_encoded = [encoder(s) for s in subval.data[1:]]
+                                            encoded = [
+                                                encoder(s) for s in subval.data[:-1]
+                                            ]
+                                            next_encoded = [
+                                                encoder(s) for s in subval.data[1:]
+                                            ]
                                         except Exception as e:
                                             raise RuntimeError(
                                                 f"Failed to encode string at {path_key}: {e}"
                                             ) from e
-                                        combined = torch.stack(encoded + next_encoded).flatten()
-                                        if combined.dtype in (torch.int64, torch.int32, torch.uint8):
+                                        combined = torch.stack(
+                                            encoded + next_encoded
+                                        ).flatten()
+                                        if combined.dtype in (
+                                            torch.int64,
+                                            torch.int32,
+                                            torch.uint8,
+                                        ):
                                             max_val = combined.max().item()
                                             field_max_tracker[path_key] = max(
-                                                max_val, field_max_tracker.get(path_key, 0)
+                                                max_val,
+                                                field_max_tracker.get(path_key, 0),
                                             )
-                                        data_view["observation", subkey].copy_(torch.stack(encoded))
-                                        data_view["next", "observation", subkey].copy_(torch.stack(next_encoded))
+                                        data_view["observation", subkey].copy_(
+                                            torch.stack(encoded)
+                                        )
+                                        data_view["next", "observation", subkey].copy_(
+                                            torch.stack(next_encoded)
+                                        )
                                     else:
-                                        if isinstance(data_view["observation", subkey], TensorDict):
-                                            data_view["observation"].copy_({subkey: subval[:-1]})
-                                            data_view["next", "observation"].copy_({subkey: subval[1:]})
-                                        elif isinstance(data_view["observation", subkey], list):
+                                        if isinstance(
+                                            data_view["observation", subkey], TensorDict
+                                        ):
+                                            data_view["observation"].copy_(
+                                                {subkey: subval[:-1]}
+                                            )
+                                            data_view["next", "observation"].copy_(
+                                                {subkey: subval[1:]}
+                                            )
+                                        elif isinstance(
+                                            data_view["observation", subkey], list
+                                        ):
                                             # TODO: Unfortunately the copy_ method fais when dealing with
                                             #       subvals of NonTensorData. It fails with this
                                             #       RuntimeError: Cannot update a leaf NonTensorDataBase from a memmaped
@@ -369,7 +403,9 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
                                             #       But this current approach takes incredibly long to complete, maybe
                                             #       I should do something different?
                                             with data_view.unlock_():
-                                                data_view.set(("observation", subkey), subval[:-1])
+                                                data_view.set(
+                                                    ("observation", subkey), subval[:-1]
+                                                )
 
                             elif isinstance(val, torch.Tensor):
                                 if steps != val.shape[0] - 1:
@@ -422,13 +458,16 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
                         subval = h5_data.get(episode_key)["observations"][field]
                         sampled_values[path_key] = subval[0]  # eager copy
                     except Exception as e:
-                        torchrl_logger.warning(f"Could not extract value for {path_key}: {e}")
+                        torchrl_logger.warning(
+                            f"Could not extract value for {path_key}: {e}"
+                        )
 
             h5_data.close()
             # Add a "done" entry
             if self.split_trajs:
                 with td_data.unlock_():
                     from torchrl.collectors.utils import split_trajectories
+
                     td_data = split_trajectories(td_data).memmap_(str(self.data_path))
 
             with open(self.metadata_path, "w") as metadata_file:
@@ -444,8 +483,11 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
                                 example_value = sampled_values[path_key]
                                 example_tensor = encoder(example_value)
                                 max_val = field_max_tracker.get(path_key, None)
-                                obs_space["subspaces"][field] = self._tensor_to_spec_dict(example_tensor,
-                                                                                          max_value=max_val)
+                                obs_space["subspaces"][
+                                    field
+                                ] = self._tensor_to_spec_dict(
+                                    example_tensor, max_value=max_val
+                                )
                             except Exception as e:
                                 torchrl_logger.warning(
                                     f"Could not encode observation field '{field}' for metadata: {e}"
@@ -460,7 +502,9 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
             return td_data
 
     @staticmethod
-    def _tensor_to_spec_dict(tensor: torch.Tensor, max_value: int | None = None) -> dict:
+    def _tensor_to_spec_dict(
+        tensor: torch.Tensor, max_value: int | None = None
+    ) -> dict:
         if tensor.dtype in (torch.float32, torch.float64, torch.float16):
             return {
                 "type": "Box",

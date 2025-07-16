@@ -3460,7 +3460,9 @@ class TestMinari:
         object_types = ["box", "ball", "key"]
         mission_to_idx = {
             f"pick up {color} {obj}": i
-            for i, (color, obj) in enumerate((c, o) for c in colors for o in object_types)
+            for i, (color, obj) in enumerate(
+                (c, o) for c in colors for o in object_types
+            )
         }
         num_missions = len(mission_to_idx)
 
@@ -3470,15 +3472,15 @@ class TestMinari:
             idx = mission_to_idx.get(clean_mission, -1)
             if idx == -1:
                 raise ValueError(f"Unknown mission string: {clean_mission}")
-            return torch.nn.functional.one_hot(torch.tensor(idx), num_classes=num_missions).to(torch.uint8)
+            return torch.nn.functional.one_hot(
+                torch.tensor(idx), num_classes=num_missions
+            ).to(torch.uint8)
 
         data = MinariExperienceReplay(
             dataset_id=selected_dataset,
             batch_size=1,
             download="force",
-            string_to_tensor_map={
-                "observations/mission": encode_mission_string
-            }
+            string_to_tensor_map={"observations/mission": encode_mission_string},
         )
         sample = data.sample(batch_size=1)
         assert isinstance(sample["observation", "mission"], torch.Tensor)

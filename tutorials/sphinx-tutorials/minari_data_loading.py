@@ -1,6 +1,6 @@
 import torch
-from torchrl.data.datasets.minari_data import MinariExperienceReplay
 from torchrl._utils import logger as torchrl_logger
+from torchrl.data.datasets.minari_data import MinariExperienceReplay
 
 # Define the possible missions
 COLORS = ["red", "green", "blue", "purple", "yellow", "grey"]
@@ -19,7 +19,9 @@ def encode_mission_string(mission: bytes) -> torch.Tensor:
     idx = MISSION_TO_IDX.get(clean_mission, -1)
     if idx == -1:
         raise ValueError(f"Unknown mission string: {clean_mission}")
-    return torch.nn.functional.one_hot(torch.tensor(idx), num_classes=NUM_MISSIONS).to(torch.uint8)
+    return torch.nn.functional.one_hot(torch.tensor(idx), num_classes=NUM_MISSIONS).to(
+        torch.uint8
+    )
 
 
 def main():
@@ -28,9 +30,7 @@ def main():
         dataset_id="minigrid/BabyAI-Pickup/optimal-v0",
         batch_size=1,
         download="force",
-        string_to_tensor_map={
-            "observations/mission": encode_mission_string
-        }
+        string_to_tensor_map={"observations/mission": encode_mission_string},
     )
 
     # Sample and inspect

@@ -251,7 +251,8 @@ def _main(argv):
             "einops",  # For tensor operations
             "safetensors",  # For model loading
         ],
-        "all": set()}
+        "all": set(),
+    }
     for key in list(extra_requires.keys()):
         extra_requires["all"] = extra_requires["all"].union(extra_requires[key])
     extra_requires["all"] = sorted(extra_requires["all"])
