@@ -3379,6 +3379,7 @@ _MINARI_DATASETS = [str(i) for i in range(20)]
 
 
 @pytest.mark.skipif(not _has_minari or not _has_gymnasium, reason="Minari not found")
+@pytest.mark.slow
 class TestMinari:
     @pytest.mark.parametrize("split", [False, True])
     @pytest.mark.parametrize("dataset_idx", range(20))

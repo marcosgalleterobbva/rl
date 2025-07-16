@@ -256,7 +256,13 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
 
             for key, val in ref_episode.items():
                 match = _NAME_MATCH[key]
-
+                if key in ("observations", "state", "infos"):
+                    if (
+                            not val.shape
+                    ):  # no need for this, we don't need the proper length: or steps != val.shape[0] - 1:
+                        if val.is_empty():
+                            continue
+                        val = _patch_info(val)
                 if key == "observations":
                     if isinstance(val, PersistentTensorDict):
                         for subkey, subval in val.items():
@@ -374,14 +380,6 @@ class MinariExperienceReplay(BaseDatasetExperienceReplay):
                                 data_view[match].copy_(val[:-1])
 
                         elif key in ("state", "infos"):
-                            if not val.shape or steps != val.shape[0] - 1:
-                                if val.is_empty():
-                                    continue
-                                val = _patch_info(val)
-                            if steps != val.shape[0] - 1:
-                                raise RuntimeError(
-                                    f"Mismatching number of steps for key {key}: was {steps} but got {val.shape[0] - 1}."
-                                )
                             data_view["next", match].copy_(val[1:])
                             data_view[match].copy_(val[:-1])
 
