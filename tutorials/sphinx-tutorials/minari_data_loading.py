@@ -14,6 +14,11 @@ NUM_MISSIONS = len(MISSION_TO_IDX)
 
 # Define the encoder function
 def encode_mission_string(mission: bytes) -> torch.Tensor:
+    """
+    This function is an example of what the user can define as part of the NonTensorData parsing.
+    In this case, we apply a one hot encoding to categorical mission fields, but we
+    could apply any other encoding we might prefer, like BERT-like embeddings.
+    """
     mission = mission.decode("utf-8")
     clean_mission = mission.replace(" a", "").replace(" the", "")
     idx = MISSION_TO_IDX.get(clean_mission, -1)
@@ -25,7 +30,9 @@ def encode_mission_string(mission: bytes) -> torch.Tensor:
 
 
 def main():
-    # Download the dataset and apply the string-to-tensor map
+    """
+    Download the dataset and apply the string-to-tensor map
+    """
     data = MinariExperienceReplay(
         dataset_id="minigrid/BabyAI-Pickup/optimal-v0",
         batch_size=1,
