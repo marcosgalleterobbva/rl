@@ -35,7 +35,7 @@ def get_logger(
             If empty, ``None`` is returned.
         logger_name (str): Name to be used as a log_dir
         experiment_name (str): Name of the experiment
-        kwargs (dict[str]): might contain either `wandb_kwargs` or `mlflow_kwargs`
+        kwargs (dict[str, dict[str]]): might contain either `wandb_kwargs` or `mlflow_kwargs`
     """
     if logger_type == "tensorboard":
         from torchrl.record.loggers.tensorboard import TensorboardLogger

@@ -28,13 +28,13 @@ from utils import (
     make_discrete_loss,
     make_discretecql_model,
     make_environment,
-    make_offline_discrete_replay_buffer,
+    make_offline_replay_buffer,
 )
 
 torch.set_float32_matmul_precision("high")
 
 
-@hydra.main(version_base="1.1", config_path="", config_name="discrete_offline_config")
+@hydra.main(version_base="1.1", config_path="", config_name="UnLockLocal_discrete_offline_config")
 def main(cfg):  # noqa: F821
     device = cfg.optim.device
     if device in ("", None):
@@ -67,7 +67,7 @@ def main(cfg):  # noqa: F821
         )
 
     # Create replay buffer
-    replay_buffer = make_offline_discrete_replay_buffer(cfg.replay_buffer)
+    replay_buffer = make_offline_replay_buffer(cfg.replay_buffer)
 
     # Create env
     train_env, eval_env = make_environment(
@@ -117,7 +117,10 @@ def main(cfg):  # noqa: F821
         update = torch.compile(update, mode=compile_mode)
     if cfg.compile.cudagraphs:
         warnings.warn(
-            "CudaGraphModule es experimental y puede llevar a resultados incorrectos silenciosamente. Úsalo con precaución.",
+            """
+            CudaGraphModule is experimental and may silently lead to incorrect results.
+            Use with caution.
+            """,
             category=UserWarning,
         )
         update = CudaGraphModule(update, warmup=50)
