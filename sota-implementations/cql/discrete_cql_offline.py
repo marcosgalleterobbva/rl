@@ -34,7 +34,111 @@ from utils import (
 torch.set_float32_matmul_precision("high")
 
 
-@hydra.main(version_base="1.1", config_path="", config_name="UnLockLocal_discrete_offline_config")
+# ---- robust mission two-hot for replay batches ----
+def _encode_mission_twohot_inplace(td, default_open=True):
+    """
+    Encode BOTH ('observation','mission') and ('next','observation','mission')
+    to 2-d two-hot [pick_key, open_door]. Robust to NonTensorStack, lists, scalars.
+    """
+    import torch
+
+    def _as_list(x):
+        # Convert NonTensorStack / object tensor / ndarray / list / scalar into a Python list
+        if isinstance(x, torch.Tensor) and x.dtype == torch.object:
+            arr = x.cpu().numpy()
+            if arr.shape == ():
+                return [arr.item()]
+            return arr.tolist()
+        if isinstance(x, np.ndarray):
+            return [x.item()] if x.shape == () else x.tolist()
+        if isinstance(x, (list, tuple)):
+            return list(x)
+        # NonTensorStack or other iterable (not bytes/str)
+        if hasattr(x, "__len__") and not isinstance(x, (bytes, bytearray, str)):
+            try:
+                return list(x)
+            except Exception:
+                return [x]
+        return [x]
+
+    def _encode_list(missions, B):
+        # fix length to B (replicate or truncate)
+        if len(missions) == 1 and B > 1:
+            missions = missions * B
+        elif len(missions) != B:
+            missions = [missions[i % len(missions)] for i in range(B)]
+        # two-hot encode
+        out = []
+        for m in missions:
+            s = m.decode("utf-8") if isinstance(m, (bytes, bytearray)) else str(m)
+            s = s.lower()
+            v = torch.zeros(2, dtype=torch.uint8)
+            if ("pick" in s and "key" in s) or ("grab" in s and "key" in s):
+                v[0] = 1
+            elif "open" in s and "door" in s:
+                v[1] = 1
+            else:
+                v[1 if default_open else 0] = 1
+            out.append(v)
+        return torch.stack(out, 0)  # [B,2], uint8
+
+    # infer batch size
+    bs = td.batch_size
+    B = int(bs[0]) if len(bs) else 1
+
+    # 1) observation.mission
+    try:
+        val = td.get(("observation", "mission"))
+        # if already numeric two-hot with proper batch, skip
+        if isinstance(val, torch.Tensor) and val.dtype != torch.object and val.ndim >= 2 and val.shape[0] == B and val.shape[-1] == 2:
+            pass
+        else:
+            missions = _as_list(val)
+            batch = _encode_list(missions, B)
+            td.set(("observation", "mission"), batch)
+    except KeyError:
+        pass
+
+    # 2) next.observation.mission (keep specs consistent)
+    try:
+        val_n = td.get(("next", "observation", "mission"))
+        if isinstance(val_n, torch.Tensor) and val_n.dtype != torch.object and val_n.ndim >= 2 and val_n.shape[0] == B and val_n.shape[-1] == 2:
+            pass
+        else:
+            missions_n = _as_list(val_n)
+            batch_n = _encode_list(missions_n, B)
+            td.set(("next", "observation", "mission"), batch_n)
+    except KeyError:
+        pass
+
+    return td
+
+
+def _normalize_offline_obs_keys(td):
+    """Mirror nested ('observation', *) and ('next','observation', *)
+    to the top-level keys expected by the model, including inside 'next' TD.
+    This makes value_estimator(next_td) find 'image'/'mission' too.
+    """
+    # current step -> top-level
+    for k in ("image", "mission"):
+        try:
+            v = td.get(("observation", k))
+            td.set(k, v)
+        except KeyError:
+            pass
+
+    # next step -> inside 'next' TD
+    for k in ("image", "mission"):
+        try:
+            vnext = td.get(("next", "observation", k))
+            td.set(("next", k), vnext)
+        except KeyError:
+            pass
+
+    return td
+
+
+@hydra.main(version_base="1.1", config_path="", config_name="minari_discrete_config")
 def main(cfg):  # noqa: F821
     device = cfg.optim.device
     if device in ("", None):
@@ -132,6 +236,25 @@ def main(cfg):  # noqa: F821
     evaluation_interval = cfg.logger.eval_iter
     eval_steps = cfg.logger.eval_steps
 
+    # ---- optional mission encoding toggle (from cfg.mission.*) ----
+    # Defaults: don't encode; default class = "open_door"
+    mission_encode = False
+    default_open = True
+    try:
+        if "mission" in cfg and cfg.mission is not None:
+            mission_encode = bool(getattr(cfg.mission, "encode_replay", False))
+            # Either mission.default or mission.twohot.default may be present
+            default_val = None
+            if hasattr(cfg.mission, "default"):
+                default_val = str(cfg.mission.default).lower()
+            elif hasattr(cfg.mission, "twohot") and "default" in cfg.mission.twohot:
+                default_val = str(cfg.mission.twohot.default).lower()
+            if default_val in ("pick_key", "pick", "key"):
+                default_open = False
+    except Exception:
+        # keep safe defaults
+        pass
+
     # Training loop
     policy_eval_start = torch.tensor(policy_eval_start, device=device)
     for i in range(gradient_steps):
@@ -140,6 +263,8 @@ def main(cfg):  # noqa: F821
         # sample data
         with timeit("sample"):
             data = replay_buffer.sample()
+            data = _encode_mission_twohot_inplace(data, default_open=True)
+            data = _normalize_offline_obs_keys(data)
 
         with timeit("update"):
             torch.compiler.cudagraph_mark_step_begin()

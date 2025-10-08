@@ -6,8 +6,11 @@ from __future__ import annotations
 
 import functools
 
+import gymnasium as gym
+import numpy as np
 import torch.nn
 import torch.optim
+from gymnasium.spaces import Dict, Box
 from tensordict.nn import TensorDictModule, TensorDictSequential
 from tensordict.nn.distributions import NormalParamExtractor
 
@@ -31,6 +34,7 @@ from torchrl.envs import (
     TransformedEnv,
 )
 from torchrl.envs.libs.gym import GymEnv, set_gym_backend
+from torchrl.envs.libs.gym import GymWrapper
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.modules import (
     EGreedyModule,
@@ -42,12 +46,88 @@ from torchrl.modules import (
 )
 from torchrl.objectives import CQLLoss, DiscreteCQLLoss, SoftUpdate
 from torchrl.record import VideoRecorder
-
 from torchrl.trainers.helpers.models import ACTIVATIONS
 
 # ====================================================================
 # Environment utils
 # -----------------
+
+
+class MissionSlotsTwoHot(gym.ObservationWrapper):
+    """
+    Replace 'mission' string with a 2-d one-hot [pick_key, open_door]
+    AND return ONLY the keys we declare ('image', 'mission').
+    This prevents TorchRL from seeing unexpected keys like 'direction'.
+    """
+    def __init__(self, env, default_open=True):
+        super().__init__(env)
+        assert isinstance(env.observation_space, Dict), \
+            "Expected Dict observation with keys like {'image','mission'}."
+        if "image" not in env.observation_space.spaces or "mission" not in env.observation_space.spaces:
+            raise RuntimeError("MissionSlotsTwoHot expects 'image' and 'mission' in the base env observation_space.")
+
+        img_space = env.observation_space.spaces["image"]
+        self.default_open = default_open
+
+        # We only expose these two keys
+        self.keep_keys = ("image", "mission")
+
+        self.observation_space = Dict(
+            image=img_space,
+            mission=Box(low=0, high=1, shape=(2,), dtype=np.uint8),
+        )
+
+    def observation(self, obs):
+        # --- build the two-hot from the *original* mission ---
+        s = obs["mission"]
+        s = s.decode("utf-8") if isinstance(s, (bytes, bytearray)) else str(s)
+        s = s.lower()
+        vec = np.zeros(2, dtype=np.uint8)
+        if ("pick" in s and "key" in s) or ("grab" in s and "key" in s):
+            vec[0] = 1  # pick_key
+        elif "open" in s and "door" in s:
+            vec[1] = 1  # open_door
+        else:
+            vec[1 if self.default_open else 0] = 1
+
+        # --- return ONLY the keys we promise in observation_space ---
+        return {
+            "image": obs["image"],
+            "mission": vec,
+        }
+
+
+class FlattenConcatKeys(torch.nn.Module):
+    """
+    Flattens the first tensor (e.g., image) and any number of extra tensors,
+    casts to float32, optionally normalizes uint8 to [0,1], and concatenates.
+
+    Use via TensorDictModule with in_keys=[image_key, *extra_keys] and a single out_key.
+    """
+    def __init__(self, normalize_uint8_image: bool = False, normalize_uint8_extras: bool = False):
+        super().__init__()
+        self.normalize_uint8_image = normalize_uint8_image
+        self.normalize_uint8_extras = normalize_uint8_extras
+
+    @staticmethod
+    def _prep(t: torch.Tensor, normalize: bool) -> torch.Tensor:
+        # Cast + optional 0..255 -> 0..1
+        if t.dtype == torch.uint8:
+            t = t.to(torch.float32)
+            if normalize:
+                t = t / 255.0
+        else:
+            t = t.to(torch.float32)
+        # Flatten all non-batch dims
+        return t.flatten(1)
+
+    def forward(self, *tensors: torch.Tensor) -> torch.Tensor:
+        assert len(tensors) >= 1, "FlattenConcatKeys expects at least one input tensor"
+        img = self._prep(tensors[0], self.normalize_uint8_image)
+        if len(tensors) == 1:
+            return img
+        extras = [self._prep(t, self.normalize_uint8_extras) for t in tensors[1:]]
+        return torch.cat([img] + extras, dim=-1)
 
 
 def env_maker(cfg, device="cpu", from_pixels=False):
@@ -64,6 +144,16 @@ def env_maker(cfg, device="cpu", from_pixels=False):
         return TransformedEnv(
             env, CatTensors(in_keys=env.observation_spec.keys(), out_key="observation")
         )
+    elif lib == "minari":
+        import minari
+        ds = minari.load_dataset(cfg.replay_buffer.dataset)
+        base_env = ds.recover_environment(eval_env=False)  # gymnasium.Env instance
+
+        # ALWAYS convert mission to a numeric tensor before TorchRL sees it
+        env = MissionSlotsTwoHot(base_env, default_open=True)
+
+        # Hand instance to TorchRL (no registry lookups)
+        return GymWrapper(env, device=device, from_pixels=from_pixels, pixels_only=False)
     else:
         raise NotImplementedError(f"Unknown lib {lib}.")
 
@@ -311,26 +401,55 @@ def make_cql_model(cfg, train_env, eval_env, device="cpu"):
 
 def make_discretecql_model(cfg, train_env, eval_env, device="cpu"):
     model_cfg = cfg.model
-
     action_spec = train_env.action_spec
 
+    # ---- NEW: configurable concat of image + arbitrary extra keys ----
+    concat_cfg = getattr(model_cfg, "concat", None)
+    image_key = (concat_cfg.image_key if concat_cfg and "image_key" in concat_cfg else "image")
+    extra_keys = list(concat_cfg.extra_keys) if (concat_cfg and "extra_keys" in concat_cfg) else ["mission"]
+    out_key = (concat_cfg.out_key if concat_cfg and "out_key" in concat_cfg else "obs_vec")
+    norm_img = bool(getattr(concat_cfg, "normalize_uint8_image", False)) if concat_cfg else False
+    norm_ext = bool(getattr(concat_cfg, "normalize_uint8_extras", False)) if concat_cfg else False
+
+    in_keys_for_concat = [image_key] + (extra_keys or [])
+
+    pre = TensorDictModule(
+        FlattenConcatKeys(
+            normalize_uint8_image=norm_img,
+            normalize_uint8_extras=norm_ext,
+        ),
+        in_keys=in_keys_for_concat,
+        out_keys=[out_key],
+    )
+
+    # ---- Q network on the concatenated vector ----
     actor_net_kwargs = {
         "num_cells": model_cfg.hidden_sizes,
         "out_features": action_spec.shape[-1],
         "activation_class": ACTIVATIONS[model_cfg.activation],
     }
     actor_net = MLP(**actor_net_kwargs)
-    qvalue_module = QValueActor(
+
+    # Inner QValueActor that reads the concatenated vector
+    qvalue_core = QValueActor(
         module=actor_net,
         spec=Composite(action=action_spec),
-        in_keys=["observation"],
+        in_keys=[out_key],
     )
-    qvalue_module = qvalue_module.to(device)
-    # init nets
+
+    # Wrap preprocessor + qvalue_core
+    qvalue_net = TensorDictSequential(pre, qvalue_core).to(device)
+
+    # ---- expose attributes needed by DiscreteCQLLoss on the wrapper ----
+    #qvalue_net.action_space = "categorical"
+    # optional but nice to have
+    if hasattr(qvalue_core, "spec"):
+        qvalue_net.spec = qvalue_core.spec
+
+    # init
     with torch.no_grad(), set_exploration_type(ExplorationType.RANDOM):
-        td = eval_env.reset()
-        td = td.to(device)
-        qvalue_module(td)
+        td = eval_env.reset().to(device)
+        qvalue_net(td)
 
     del td
     greedy_module = EGreedyModule(
@@ -339,11 +458,8 @@ def make_discretecql_model(cfg, train_env, eval_env, device="cpu"):
         eps_end=cfg.collector.eps_end,
         spec=action_spec,
     )
-    model_explore = TensorDictSequential(
-        qvalue_module,
-        greedy_module,
-    ).to(device)
-    return qvalue_module, model_explore
+    model_explore = TensorDictSequential(qvalue_net, greedy_module).to(device)
+    return qvalue_net, model_explore
 
 
 def make_cql_modules_state(model_cfg, proof_environment):

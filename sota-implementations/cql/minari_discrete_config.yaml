@@ -1,0 +1,84 @@
+# =========================
+# minari_discrete_config.yaml
+# =========================
+
+# -------- env and task --------
+env:
+  backend: minari           # env is reconstructed from the Minari dataset
+  task: ""
+  library: minari
+  n_samples_stats: 1000
+  seed: 0
+
+# -------- offline replay buffer --------
+replay_buffer:
+  env: BabyAI-UnlockLocal-v0
+  dataset: "minigrid/BabyAI-UnlockLocal/optimal-v0"
+  batch_size: 128
+  episodes: 10000
+
+# -------- logging --------
+logger:
+  backend: null
+  project_name: torchrl_example_cql
+  group_name: null
+  exp_name: cql_${replay_buffer.dataset}
+  eval_iter: 5000
+  eval_steps: 1000
+  mode: offline
+  eval_envs: 1
+  video: false
+
+# -------- model (Q-network / policy) --------
+model:
+  hidden_sizes: [256, 256]
+  dueling: false
+  layer_norm: false
+  activation: "relu"
+  state_key: "observation"
+  action_key: "action"
+  value_key: "state_value"
+  ortho_init: true
+  concat:
+    image_key: image
+    extra_keys: [ mission ]   # put any patched keys here; [] if none
+    out_key: obs_vec
+    normalize_uint8_image: false
+    normalize_uint8_extras: false
+
+# -------- loss (CQL + DQN bits) --------
+loss:
+  action_space: "categorical"
+  gamma: 0.99
+  tau: 0.005
+  double_dqn: true
+  loss_function: "l2"      # <- explicit for DiscreteCQLLoss
+  cql:
+    alpha: 1.0
+    temperature: 1.0
+    with_lagrange: false
+    target_action_gap: 0.0
+    n_action_samples: null
+  reduction: "mean"
+
+# -------- collector knobs used by make_discretecql_model (ε-greedy anneal) --------
+collector:
+  annealing_frames: 100000
+  eps_start: 1.0
+  eps_end: 0.05
+
+# -------- optimization --------
+optim:
+  device: ""               # auto: cuda:0 if available, else cpu
+  gradient_steps: 100000
+  policy_eval_start: 10000
+  lr: 3e-4
+  weight_decay: 0.0
+  eps: 1.0e-8
+  max_grad_norm: null
+
+# -------- compile / speedups --------
+compile:
+  compile: false
+  compile_mode: null       # "reduce-overhead" | "max-autotune" | "default"
+  cudagraphs: false
