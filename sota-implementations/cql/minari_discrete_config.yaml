@@ -2,13 +2,17 @@
 # minari_discrete_config.yaml
 # =========================
 
+# --- Hydra runtime behavior ---
+hydra:
+  job:
+    chdir: true   # keep the old behavior and silence the warning
+
 # -------- env and task --------
 env:
   backend: minari           # env is reconstructed from the Minari dataset
   task: ""
   library: minari
   n_samples_stats: 1000
-  seed: 0
 
 # -------- offline replay buffer --------
 replay_buffer:
@@ -32,6 +36,7 @@ logger:
 # -------- model (Q-network / policy) --------
 model:
   hidden_sizes: [256, 256]
+  mission_emb_dim: 32
   dueling: false
   layer_norm: false
   activation: "relu"
@@ -39,6 +44,10 @@ model:
   action_key: "action"
   value_key: "state_value"
   ortho_init: true
+  verb_emb_dim: 16
+  noun_emb_dim: 16
+  color_emb_dim: 8
+  mission_combiner: "concat"   # or "sum"
   concat:
     image_key: image
     extra_keys: [ mission ]   # put any patched keys here; [] if none
@@ -69,6 +78,7 @@ collector:
 
 # -------- optimization --------
 optim:
+  seed: 0
   device: ""               # auto: cuda:0 if available, else cpu
   gradient_steps: 100000
   policy_eval_start: 10000

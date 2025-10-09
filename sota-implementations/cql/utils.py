@@ -47,10 +47,35 @@ from torchrl.modules import (
 from torchrl.objectives import CQLLoss, DiscreteCQLLoss, SoftUpdate
 from torchrl.record import VideoRecorder
 from torchrl.trainers.helpers.models import ACTIVATIONS
+import numpy as np
+from gymnasium.spaces import Dict, Discrete, Box
 
 # ====================================================================
 # Environment utils
 # -----------------
+
+# --- mission vocab (extend as needed) ---
+VERBS  = ["open", "pick", "go"]          # add "put", "toggle", ...
+NOUNS  = ["door", "key", "ball"]         # add others as needed
+COLORS = ["red", "blue", "green", "yellow", "purple", "grey"]  # BabyAI colors
+
+VERB2ID  = {w: i for i, w in enumerate(VERBS)}
+NOUN2ID  = {w: i for i, w in enumerate(NOUNS)}
+COLOR2ID = {w: i for i, w in enumerate(COLORS)}
+
+UNK_VERB  = len(VERBS)
+UNK_NOUN  = len(NOUNS)
+UNK_COLOR = len(COLORS)
+
+
+def parse_mission_parts(text: str):
+    """Very dumb parser: lowercases and scans tokens for verb/noun/color. Returns (verb_id, noun_id, color_id)."""
+    s = text.lower()
+    tokens = s.replace(".", " ").replace(",", " ").split()
+    v = next((VERB2ID[t] for t in tokens if t in VERB2ID), UNK_VERB)
+    n = next((NOUN2ID[t] for t in tokens if t in NOUN2ID), UNK_NOUN)
+    c = next((COLOR2ID[t] for t in tokens if t in COLOR2ID), UNK_COLOR)
+    return v, n, c
 
 
 class MissionSlotsTwoHot(gym.ObservationWrapper):
@@ -130,6 +155,115 @@ class FlattenConcatKeys(torch.nn.Module):
         return torch.cat([img] + extras, dim=-1)
 
 
+class ConcatImageWithMissionEmbedding(torch.nn.Module):
+    def __init__(self, vocab_size: int = 2, emb_dim: int = 32, normalize_uint8_image: bool = False):
+        super().__init__()
+        self.normalize_uint8_image = normalize_uint8_image
+        self.emb = torch.nn.Embedding(vocab_size, emb_dim)
+
+    def _prep_img(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.to(torch.float32)
+        if self.normalize_uint8_image and x.dtype == torch.uint8:
+            x = x / 255.0
+        return x.flatten(1)
+
+    def forward(self, td):
+        img = self._prep_img(td["image"])
+        m = td["mission"]
+        # mission may be one-hot [B,2] or indices [B]
+        if m.ndim >= 2 and m.shape[-1] > 1:
+            midx = m.argmax(dim=-1)
+        else:
+            midx = m.long()
+        memb = self.emb(midx)  # [B, emb_dim]
+        td.set("obs_vec", torch.cat([img, memb], dim=-1))
+        return td
+
+
+class MissionPartsWrapper(gym.ObservationWrapper):
+    """
+    Returns observation as:
+      {
+        "image":   Box(..., dtype=uint8),
+        "verb":    Discrete(|VERBS|+1 for UNK),
+        "noun":    Discrete(|NOUNS|+1),
+        "color":   Discrete(|COLORS|+1),
+      }
+    Filters out any extra keys (e.g., direction).
+    """
+    def __init__(self, env):
+        super().__init__(env)
+        assert isinstance(env.observation_space, Dict), "Expected Dict obs."
+        img_space = env.observation_space.spaces["image"]
+        self.observation_space = Dict({
+            "image": img_space,
+            "verb":  Discrete(len(VERBS)  + 1),
+            "noun":  Discrete(len(NOUNS)  + 1),
+            "color": Discrete(len(COLORS) + 1),
+        })
+
+    def observation(self, obs):
+        s = obs["mission"]
+        s = s.decode("utf-8") if isinstance(s, (bytes, bytearray)) else str(s)
+        v, n, c = parse_mission_parts(s)
+        return {
+            "image": obs["image"],
+            "verb":  np.int64(v),
+            "noun":  np.int64(n),
+            "color": np.int64(c),
+        }
+
+
+class ConcatImageWithFactorizedMissionEmbedding(torch.nn.Module):
+    """
+    Flattens image and concatenates with learned embeddings for verb/noun/color.
+    Accepts each as either indices [B] or one-hot [B,V], returns a single tensor.
+    """
+    def __init__(self, verb_vocab: int, noun_vocab: int, color_vocab: int,
+                 verb_dim: int = 16, noun_dim: int = 16, color_dim: int = 8,
+                 normalize_uint8_image: bool = False, combiner: str = "concat"):
+        super().__init__()
+        self.normalize_uint8_image = normalize_uint8_image
+        self.combiner = combiner  # "concat" or "sum"
+        self.emb_v = torch.nn.Embedding(verb_vocab,  verb_dim)
+        self.emb_n = torch.nn.Embedding(noun_vocab,  noun_dim)
+        self.emb_c = torch.nn.Embedding(color_vocab, color_dim)
+
+    def _prep_img(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.to(torch.float32)
+        if x.dtype == torch.uint8:
+            x = x / 255.0
+        return x.flatten(1)
+
+    @staticmethod
+    def _to_index(x: torch.Tensor) -> torch.Tensor:
+        # supports indices [B] or one-hot [B,V]
+        return x.argmax(-1) if (x.ndim >= 2 and x.shape[-1] > 1) else x.long()
+
+    def forward(self, image: torch.Tensor, verb: torch.Tensor, noun: torch.Tensor, color: torch.Tensor) -> torch.Tensor:
+        img = self._prep_img(image)
+        vidx = self._to_index(verb)
+        nidx = self._to_index(noun)
+        cidx = self._to_index(color)
+
+        ev, en, ec = self.emb_v(vidx), self.emb_n(nidx), self.emb_c(cidx)
+
+        if self.combiner == "sum":
+            # pad to same dim then sum
+            maxd = max(ev.shape[-1], en.shape[-1], ec.shape[-1])
+            if ev.shape[-1] != maxd:
+                ev = torch.nn.functional.pad(ev, (0, maxd - ev.shape[-1]))
+            if en.shape[-1] != maxd:
+                en = torch.nn.functional.pad(en, (0, maxd - en.shape[-1]))
+            if ec.shape[-1] != maxd:
+                ec = torch.nn.functional.pad(ec, (0, maxd - ec.shape[-1]))
+            memb = ev + en + ec
+        else:
+            memb = torch.cat([ev, en, ec], dim=-1)
+
+        return torch.cat([img, memb], dim=-1)  # <- a single tensor
+
+
 def env_maker(cfg, device="cpu", from_pixels=False):
     lib = cfg.env.backend
     if lib in ("gym", "gymnasium"):
@@ -150,7 +284,8 @@ def env_maker(cfg, device="cpu", from_pixels=False):
         base_env = ds.recover_environment(eval_env=False)  # gymnasium.Env instance
 
         # ALWAYS convert mission to a numeric tensor before TorchRL sees it
-        env = MissionSlotsTwoHot(base_env, default_open=True)
+        # env = MissionSlotsTwoHot(base_env, default_open=True)
+        env = MissionPartsWrapper(base_env)  # <-- instead of MissionSlotsTwoHot
 
         # Hand instance to TorchRL (no registry lookups)
         return GymWrapper(env, device=device, from_pixels=from_pixels, pixels_only=False)
@@ -179,7 +314,7 @@ def make_environment(cfg, train_num_envs=1, eval_num_envs=1, logger=None):
         EnvCreator(maker),
         serial_for_single=True,
     )
-    parallel_env.set_seed(cfg.env.seed)
+    parallel_env.set_seed(cfg.optim.seed)
 
     train_env = apply_env_transforms(parallel_env)
 
@@ -413,13 +548,37 @@ def make_discretecql_model(cfg, train_env, eval_env, device="cpu"):
 
     in_keys_for_concat = [image_key] + (extra_keys or [])
 
+    # pre = TensorDictModule(
+    #     FlattenConcatKeys(
+    #         normalize_uint8_image=norm_img,
+    #         normalize_uint8_extras=norm_ext,
+    #     ),
+    #     in_keys=in_keys_for_concat,
+    #     out_keys=[out_key],
+    # )
+    # pre = TensorDictModule(FlattenConcatKeys(...), in_keys=[image_key, "mission"], out_keys=[out_key])
+    # pre = TensorDictModule(
+    #     ConcatImageWithMissionEmbedding(
+    #         vocab_size=2,  # adjust if you add more missions later
+    #         emb_dim=getattr(model_cfg, "mission_emb_dim", 32),
+    #         normalize_uint8_image=bool(getattr(model_cfg.get("concat", {}), "normalize_uint8_image", False)),
+    #     ),
+    #     in_keys=[image_key, "mission"],
+    #     out_keys=[out_key],
+    # )
     pre = TensorDictModule(
-        FlattenConcatKeys(
-            normalize_uint8_image=norm_img,
-            normalize_uint8_extras=norm_ext,
+        ConcatImageWithFactorizedMissionEmbedding(
+            verb_vocab=len(VERBS) + 1,
+            noun_vocab=len(NOUNS) + 1,
+            color_vocab=len(COLORS) + 1,
+            verb_dim=getattr(model_cfg, "verb_emb_dim", 16),
+            noun_dim=getattr(model_cfg, "noun_emb_dim", 16),
+            color_dim=getattr(model_cfg, "color_emb_dim", 8),
+            normalize_uint8_image=bool(getattr(model_cfg.get("concat", {}), "normalize_uint8_image", False)),
+            combiner=getattr(model_cfg, "mission_combiner", "concat"),
         ),
-        in_keys=in_keys_for_concat,
-        out_keys=[out_key],
+        in_keys=["image", "verb", "noun", "color"],
+        out_keys=[out_key],  # e.g., "obs_vec"
     )
 
     # ---- Q network on the concatenated vector ----
@@ -441,7 +600,7 @@ def make_discretecql_model(cfg, train_env, eval_env, device="cpu"):
     qvalue_net = TensorDictSequential(pre, qvalue_core).to(device)
 
     # ---- expose attributes needed by DiscreteCQLLoss on the wrapper ----
-    #qvalue_net.action_space = "categorical"
+    qvalue_net.action_space = "categorical"
     # optional but nice to have
     if hasattr(qvalue_core, "spec"):
         qvalue_net.spec = qvalue_core.spec

@@ -29,6 +29,7 @@ from utils import (
     make_discretecql_model,
     make_environment,
     make_offline_replay_buffer,
+    parse_mission_parts,
 )
 
 torch.set_float32_matmul_precision("high")
@@ -114,6 +115,50 @@ def _encode_mission_twohot_inplace(td, default_open=True):
     return td
 
 
+def _encode_mission_parts_inplace(td):
+    import torch
+
+    def _to_list(x):
+        if isinstance(x, torch.Tensor) and x.dtype == torch.object:
+            arr = x.cpu().numpy()
+            return arr.tolist() if arr.shape else [arr.item()]
+        if hasattr(x, "__iter__") and not isinstance(x, (bytes, bytearray, str)):
+            try: return list(x)
+            except Exception: return [x]
+        return [x]
+
+    B = int(td.batch_size[0]) if len(td.batch_size) else 1
+    for path in [("observation","mission"), ("next","observation","mission")]:
+        try:
+            val = td.get(path)
+        except KeyError:
+            continue
+        missions = _to_list(val)
+        if len(missions) == 1 and B > 1:
+            missions = missions * B
+        v_idx, n_idx, c_idx = [], [], []
+        for m in missions:
+            s = m.decode("utf-8") if isinstance(m, (bytes, bytearray)) else str(m)
+            v, n, c = parse_mission_parts(s)
+            v_idx.append(v); n_idx.append(n); c_idx.append(c)
+        td.set(path[:-1] + ("verb",),  torch.tensor(v_idx, dtype=torch.int64))
+        td.set(path[:-1] + ("noun",),  torch.tensor(n_idx, dtype=torch.int64))
+        td.set(path[:-1] + ("color",), torch.tensor(c_idx, dtype=torch.int64))
+    # mirror to top-level for current step
+    for k in ("verb","noun","color","image"):
+        try:
+            td.set(k, td.get(("observation", k)))
+        except KeyError:
+            pass
+    # mirror into next sub-TD
+    for k in ("verb","noun","color","image"):
+        try:
+            td.set(("next", k), td.get(("next","observation", k)))
+        except KeyError:
+            pass
+    return td
+
+
 def _normalize_offline_obs_keys(td):
     """Mirror nested ('observation', *) and ('next','observation', *)
     to the top-level keys expected by the model, including inside 'next' TD.
@@ -162,13 +207,10 @@ def main(cfg):  # noqa: F821
         )
 
     # Set seeds
-    torch.manual_seed(cfg.env.seed)
-    np.random.seed(cfg.env.seed)
-    if cfg.env.seed is not None:
-        warnings.warn(
-            "The seed in the environment config is deprecated. "
-            "Please set the seed in the optim config instead."
-        )
+    seed = getattr(cfg.optim, "seed", None)
+    if seed is not None:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
 
     # Create replay buffer
     replay_buffer = make_offline_replay_buffer(cfg.replay_buffer)
@@ -263,7 +305,8 @@ def main(cfg):  # noqa: F821
         # sample data
         with timeit("sample"):
             data = replay_buffer.sample()
-            data = _encode_mission_twohot_inplace(data, default_open=True)
+            # data = _encode_mission_twohot_inplace(data, default_open=True)
+            data = _encode_mission_parts_inplace(data)  # instead of two-hot
             data = _normalize_offline_obs_keys(data)
 
         with timeit("update"):
