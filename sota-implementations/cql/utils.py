@@ -10,7 +10,7 @@ import gymnasium as gym
 import numpy as np
 import torch.nn
 import torch.optim
-from gymnasium.spaces import Dict, Box
+from gymnasium.spaces import Dict, Discrete, Box
 from tensordict.nn import TensorDictModule, TensorDictSequential
 from tensordict.nn.distributions import NormalParamExtractor
 
@@ -47,8 +47,6 @@ from torchrl.modules import (
 from torchrl.objectives import CQLLoss, DiscreteCQLLoss, SoftUpdate
 from torchrl.record import VideoRecorder
 from torchrl.trainers.helpers.models import ACTIVATIONS
-import numpy as np
-from gymnasium.spaces import Dict, Discrete, Box
 
 # ====================================================================
 # Environment utils
@@ -167,17 +165,16 @@ class ConcatImageWithMissionEmbedding(torch.nn.Module):
             x = x / 255.0
         return x.flatten(1)
 
-    def forward(self, td):
-        img = self._prep_img(td["image"])
-        m = td["mission"]
-        # mission may be one-hot [B,2] or indices [B]
-        if m.ndim >= 2 and m.shape[-1] > 1:
-            midx = m.argmax(dim=-1)
-        else:
-            midx = m.long()
+    @staticmethod
+    def _to_index(m: torch.Tensor) -> torch.Tensor:
+        # supports one-hot [B,V] or indices [B]
+        return m.argmax(-1) if (m.ndim >= 2 and m.shape[-1] > 1) else m.long()
+
+    def forward(self, image: torch.Tensor, mission: torch.Tensor) -> torch.Tensor:
+        img = self._prep_img(image)
+        midx = self._to_index(mission)
         memb = self.emb(midx)  # [B, emb_dim]
-        td.set("obs_vec", torch.cat([img, memb], dim=-1))
-        return td
+        return torch.cat([img, memb], dim=-1)
 
 
 class MissionPartsWrapper(gym.ObservationWrapper):
@@ -231,7 +228,7 @@ class ConcatImageWithFactorizedMissionEmbedding(torch.nn.Module):
 
     def _prep_img(self, x: torch.Tensor) -> torch.Tensor:
         x = x.to(torch.float32)
-        if x.dtype == torch.uint8:
+        if self.normalize_uint8_image and x.dtype == torch.uint8:  # add the flag
             x = x / 255.0
         return x.flatten(1)
 
@@ -268,27 +265,53 @@ def env_maker(cfg, device="cpu", from_pixels=False):
     lib = cfg.env.backend
     if lib in ("gym", "gymnasium"):
         with set_gym_backend(lib):
-            return GymEnv(
-                cfg.env.name, device=device, from_pixels=from_pixels, pixels_only=False
-            )
+            return GymEnv(cfg.env.name, device=device, from_pixels=from_pixels, pixels_only=False)
+
     elif lib == "dm_control":
-        env = DMControlEnv(
-            cfg.env.name, cfg.env.task, from_pixels=from_pixels, pixels_only=False
-        )
-        return TransformedEnv(
-            env, CatTensors(in_keys=env.observation_spec.keys(), out_key="observation")
-        )
+        env = DMControlEnv(cfg.env.name, cfg.env.task, from_pixels=from_pixels, pixels_only=False)
+        return TransformedEnv(env, CatTensors(in_keys=env.observation_spec.keys(), out_key="observation"))
+
     elif lib == "minari":
-        import minari
+        import minari, warnings, gymnasium as gym
         ds = minari.load_dataset(cfg.replay_buffer.dataset)
-        base_env = ds.recover_environment(eval_env=False)  # gymnasium.Env instance
 
-        # ALWAYS convert mission to a numeric tensor before TorchRL sees it
-        # env = MissionSlotsTwoHot(base_env, default_open=True)
-        env = MissionPartsWrapper(base_env)  # <-- instead of MissionSlotsTwoHot
+        want_pixels = bool(getattr(cfg.logger, "video", False)) or from_pixels
 
-        # Hand instance to TorchRL (no registry lookups)
-        return GymWrapper(env, device=device, from_pixels=from_pixels, pixels_only=False)
+        # 1) Try to recover with render_mode (Gymnasium style)
+        rec_kwargs = {"render_mode": "rgb_array"} if want_pixels else {}
+        try:
+            base_env = ds.recover_environment(eval_env=False, **rec_kwargs)
+        except TypeError:
+            # older Minari signature: fall back and patch below
+            base_env = ds.recover_environment(eval_env=False)
+
+        # 2) If we still don't have rgb_array, rebuild via gym.make using ds.env_spec
+        if want_pixels and getattr(base_env, "render_mode", None) != "rgb_array":
+            spec = getattr(ds, "env_spec", None)
+            try:
+                env_id = getattr(spec, "id", None) or (str(spec) if spec is not None else None)
+                kwargs = dict(getattr(spec, "kwargs", {}) or {})
+                kwargs["render_mode"] = "rgb_array"
+                if env_id is None:
+                    raise RuntimeError("Minari dataset env_spec missing/unknown.")
+                try:
+                    base_env.close()
+                except Exception:
+                    pass
+                base_env = gym.make(env_id, **kwargs)
+            except Exception as e:
+                warnings.warn(
+                    f"Failed to remake env with render_mode='rgb_array': {e}. "
+                    "Video will be disabled for this run."
+                )
+                want_pixels = False  # avoid pixel wrapper -> avoid crash
+
+        # 3) Your mission parsing wrapper
+        env = MissionPartsWrapper(base_env)
+
+        # 4) Hand instance to TorchRL. Let GymWrapper add pixels only if we *know* the env can render.
+        return GymWrapper(env, device=device, from_pixels=want_pixels, pixels_only=False)
+
     else:
         raise NotImplementedError(f"Unknown lib {lib}.")
 
@@ -327,7 +350,7 @@ def make_environment(cfg, train_num_envs=1, eval_num_envs=1, logger=None):
         ),
         train_env.transform.clone(),
     )
-    eval_env.set_seed(0)
+    eval_env.set_seed(cfg.optim.seed)
     if cfg.logger.video:
         eval_env = eval_env.insert_transform(
             0, VideoRecorder(logger=logger, tag="rendered", in_keys=["pixels"])
@@ -366,7 +389,7 @@ def make_collector(
         compile_policy={"mode": compile_mode} if compile else False,
         cudagraph_policy=cudagraph,
     )
-    collector.set_seed(cfg.env.seed)
+    collector.set_seed(getattr(cfg.optim, "seed", 0))
     return collector
 
 
@@ -556,16 +579,17 @@ def make_discretecql_model(cfg, train_env, eval_env, device="cpu"):
     #     in_keys=in_keys_for_concat,
     #     out_keys=[out_key],
     # )
-    # pre = TensorDictModule(FlattenConcatKeys(...), in_keys=[image_key, "mission"], out_keys=[out_key])
+
     # pre = TensorDictModule(
     #     ConcatImageWithMissionEmbedding(
-    #         vocab_size=2,  # adjust if you add more missions later
+    #         vocab_size=getattr(model_cfg, "mission_vocab_size", 2),
     #         emb_dim=getattr(model_cfg, "mission_emb_dim", 32),
     #         normalize_uint8_image=bool(getattr(model_cfg.get("concat", {}), "normalize_uint8_image", False)),
     #     ),
-    #     in_keys=[image_key, "mission"],
-    #     out_keys=[out_key],
+    #     in_keys=[image_key, "mission"],  # <- tensors extracted from TD
+    #     out_keys=[out_key],  # <- single tensor returned goes here
     # )
+
     pre = TensorDictModule(
         ConcatImageWithFactorizedMissionEmbedding(
             verb_vocab=len(VERBS) + 1,

@@ -18,6 +18,7 @@ import numpy as np
 import torch
 import tqdm
 from tensordict.nn import CudaGraphModule
+
 from torchrl._utils import timeit
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.record.loggers import generate_exp_name, get_logger
@@ -159,30 +160,6 @@ def _encode_mission_parts_inplace(td):
     return td
 
 
-def _normalize_offline_obs_keys(td):
-    """Mirror nested ('observation', *) and ('next','observation', *)
-    to the top-level keys expected by the model, including inside 'next' TD.
-    This makes value_estimator(next_td) find 'image'/'mission' too.
-    """
-    # current step -> top-level
-    for k in ("image", "mission"):
-        try:
-            v = td.get(("observation", k))
-            td.set(k, v)
-        except KeyError:
-            pass
-
-    # next step -> inside 'next' TD
-    for k in ("image", "mission"):
-        try:
-            vnext = td.get(("next", "observation", k))
-            td.set(("next", k), vnext)
-        except KeyError:
-            pass
-
-    return td
-
-
 @hydra.main(version_base="1.1", config_path="", config_name="minari_discrete_config")
 def main(cfg):  # noqa: F821
     device = cfg.optim.device
@@ -307,7 +284,6 @@ def main(cfg):  # noqa: F821
             data = replay_buffer.sample()
             # data = _encode_mission_twohot_inplace(data, default_open=True)
             data = _encode_mission_parts_inplace(data)  # instead of two-hot
-            data = _normalize_offline_obs_keys(data)
 
         with timeit("update"):
             torch.compiler.cudagraph_mark_step_begin()

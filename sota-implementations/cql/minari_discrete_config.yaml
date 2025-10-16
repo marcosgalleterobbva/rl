@@ -21,17 +21,16 @@ replay_buffer:
   batch_size: 128
   episodes: 10000
 
-# -------- logging --------
 logger:
-  backend: null
+  backend: wandb
   project_name: torchrl_example_cql
   group_name: null
   exp_name: cql_${replay_buffer.dataset}
+  mode: online
+  video: true
+  eval_envs: 1
   eval_iter: 5000
   eval_steps: 1000
-  mode: offline
-  eval_envs: 1
-  video: false
 
 # -------- model (Q-network / policy) --------
 model:
@@ -50,7 +49,7 @@ model:
   mission_combiner: "concat"   # or "sum"
   concat:
     image_key: image
-    extra_keys: [ mission ]   # put any patched keys here; [] if none
+    extra_keys: []        # was [mission]
     out_key: obs_vec
     normalize_uint8_image: false
     normalize_uint8_extras: false

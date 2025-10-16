@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import collections
 import copy
-from collections.abc import MutableMapping
+import inspect
 
 import numpy as np
 
@@ -29,106 +29,96 @@ STATE_KEY = "observation"
 
 
 class GymPixelObservationWrapper(ObservationWrapper):
-    """Augment observations by pixel values.
+    """Augment observations by pixel values (Gym ≤0.25 and Gymnasium ≥0.26).
 
-    Args:
-        env: The environment to wrap.
-        pixels_only: If ``True`` (default), the original observation returned
-            by the wrapped environment will be discarded, and a dictionary
-            observation will only include pixels. If ``False``, the
-            observation dictionary will contain both the original
-            observations and the pixel observations.
-        render_kwargs: Optional :obj:`dict` containing keyword arguments passed
-            to the :obj:`self.render` method.
-        pixel_keys: Optional custom string specifying the pixel
-            observation's key in the :obj:`OrderedDict` of observations.
-            Defaults to 'pixels'.
-
-    Raises:
-        ValueError: If :obj:`env`'s observation spec is not compatible with the
-            wrapper. Supported formats are a single array, or a dict of
-            arrays.
-        ValueError: If :obj:`env`'s observation already contains any of the
-            specified :obj:`pixel_keys`.
+    - Old Gym: calls env.render(mode="rgb_array")
+    - Gymnasium: expects env to be created with render_mode="rgb_array"
+      and calls env.render() with no kwargs.
     """
 
-    def __init__(
-        self, env, pixels_only=True, render_kwargs=None, pixel_keys=("pixels",)
-    ):
+    def __init__(self, env, pixels_only=True, render_kwargs=None, pixel_keys=("pixels",)):
+        # reset first so render() has something to show
         env.reset()
         super().__init__(env)
 
+        self._pixels_only = pixels_only
+        self._pixel_keys = pixel_keys
+        self._observation_is_dict = isinstance(env.observation_space, (spaces.Dict, collections.abc.MutableMapping))
+
+        # Determine if this env.render supports a "mode" kwarg (old Gym) or not (Gymnasium).
+        sig = None
+        try:
+            sig = inspect.signature(self.env.render)
+            self._supports_mode = "mode" in sig.parameters
+        except (TypeError, ValueError):
+            # Some C extensions or wrappers don’t have inspectable signatures; fall back to try/except at call time.
+            self._supports_mode = None
+
         if render_kwargs is None:
             render_kwargs = {}
-
+        self._render_kwargs = {}
         for key in pixel_keys:
-            render_kwargs.setdefault(key, {})
+            kw = dict(render_kwargs.get(key, {}))
+            if self._supports_mode is True:
+                kw.setdefault("mode", "rgb_array")
+            else:
+                # Gymnasium path: ensure we don't pass "mode"
+                kw.pop("mode", None)
+            self._render_kwargs[key] = kw
 
-            render_mode = render_kwargs[key].pop("mode", "rgb_array")
-            if render_mode != "rgb_array":
-                raise ValueError(
-                    f"Expected render_mode to be 'rgb_array', git {render_mode}"
-                )
-            render_kwargs[key]["mode"] = "rgb_array"
-
-        wrapped_observation_space = env.observation_space
-
-        if isinstance(wrapped_observation_space, spaces.Box):
-            self._observation_is_dict = False
+        # Build new observation space
+        if isinstance(env.observation_space, spaces.Box):
             invalid_keys = {STATE_KEY}
-        elif isinstance(wrapped_observation_space, (spaces.Dict, MutableMapping)):
-            self._observation_is_dict = True
-            invalid_keys = set(wrapped_observation_space.spaces.keys())
+        elif self._observation_is_dict:
+            invalid_keys = set(env.observation_space.spaces.keys())
         else:
             raise ValueError("Unsupported observation space structure.")
 
         if not pixels_only:
-            # Make sure that now keys in the `pixel_keys` overlap with
-            # `observation_keys`
-            overlapping_keys = set(pixel_keys) & set(invalid_keys)
-            if overlapping_keys:
-                raise ValueError(
-                    f"Duplicate or reserved pixel keys {overlapping_keys!r}."
-                )
+            overlapping = set(pixel_keys) & set(invalid_keys)
+            if overlapping:
+                raise ValueError(f"Duplicate or reserved pixel keys {overlapping!r}.")
 
         if pixels_only:
-            self.observation_space = spaces.Dict()
+            obs_space = spaces.Dict()
         elif self._observation_is_dict:
-            self.observation_space = copy.deepcopy(wrapped_observation_space)
+            obs_space = copy.deepcopy(env.observation_space)
         else:
-            self.observation_space = spaces.Dict()
-            self.observation_space.spaces[STATE_KEY] = wrapped_observation_space
+            obs_space = spaces.Dict()
+            obs_space.spaces[STATE_KEY] = env.observation_space
 
-        # Extend observation space with pixels.
-
+        # Probe a frame to infer pixel shape/dtype and finalize the space
         pixels_spaces = {}
         for pixel_key in pixel_keys:
-            pixels = self.env.render(**render_kwargs[pixel_key])
-
-            if np.issubdtype(pixels.dtype, np.integer):
+            frame = self._render_frame(pixel_key)
+            if frame is None:
+                raise RuntimeError(
+                    "env.render() returned None. With Gymnasium (≥0.26), you must create the env with "
+                    "render_mode='rgb_array' (e.g., gym.make(..., render_mode='rgb_array') or, for Minari, "
+                    "ds.recover_environment(render_mode='rgb_array'))."
+                )
+            frame = np.asarray(frame)
+            if np.issubdtype(frame.dtype, np.integer):
                 low, high = (0, 255)
-            elif np.issubdtype(pixels.dtype, np.float):
+            elif np.issubdtype(frame.dtype, np.floating):
                 low, high = (-float("inf"), float("inf"))
             else:
-                raise TypeError(pixels.dtype)
+                raise TypeError(f"Unsupported pixel dtype: {frame.dtype}")
+            pixels_spaces[pixel_key] = spaces.Box(shape=frame.shape, low=low, high=high, dtype=frame.dtype)
 
-            pixels_space = spaces.Box(
-                shape=pixels.shape, low=low, high=high, dtype=pixels.dtype
-            )
-            pixels_spaces[pixel_key] = pixels_space
+        obs_space.spaces.update(pixels_spaces)
+        self.observation_space = obs_space
 
-        self.observation_space.spaces.update(pixels_spaces)
+    def _render_frame(self, pixel_key):
+        kw = self._render_kwargs.get(pixel_key, {})
+        # Try explicit kwargs first; if TypeError, fall back to no-kwargs (Gymnasium).
+        try:
+            return self.env.render(**kw) if kw else self.env.render()
+        except TypeError:
+            return self.env.render()
 
-        self._env = env
-        self._pixels_only = pixels_only
-        self._render_kwargs = render_kwargs
-        self._pixel_keys = pixel_keys
-
-    def observation(self, observation):
-        pixel_observation = self._add_pixel_observation(observation)
-        return pixel_observation
-
-    def _add_pixel_observation(self, wrapped_observation):
+    def observation(self, wrapped_observation):
+        # Build the base container
         if self._pixels_only:
             observation = collections.OrderedDict()
         elif self._observation_is_dict:
@@ -137,11 +127,14 @@ class GymPixelObservationWrapper(ObservationWrapper):
             observation = collections.OrderedDict()
             observation[STATE_KEY] = wrapped_observation
 
-        pixel_observations = {
-            pixel_key: self.env.render(**self._render_kwargs[pixel_key])
-            for pixel_key in self._pixel_keys
-        }
-
-        observation.update(pixel_observations)
+        # Add pixels
+        for pixel_key in self._pixel_keys:
+            frame = self._render_frame(pixel_key)
+            if frame is None:
+                raise RuntimeError(
+                    "env.render() returned None during step. Ensure the env was created with "
+                    "render_mode='rgb_array'."
+                )
+            observation[pixel_key] = frame
 
         return observation
