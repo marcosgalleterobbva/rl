@@ -352,8 +352,8 @@ def make_environment(cfg, train_num_envs=1, eval_num_envs=1, logger=None):
     )
     eval_env.set_seed(cfg.optim.seed)
     if cfg.logger.video:
-        eval_env = eval_env.insert_transform(
-            0, VideoRecorder(logger=logger, tag="rendered", in_keys=["pixels"])
+        eval_env = eval_env.append_transform(
+            VideoRecorder(logger=logger, tag="rendered", in_keys=["pixels"])
         )
     return train_env, eval_env
 

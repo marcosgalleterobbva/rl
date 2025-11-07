@@ -137,6 +137,7 @@ celerybeat.pid
 *.sage.py
 
 # Environments
+.conda
 .env
 .venv
 env/

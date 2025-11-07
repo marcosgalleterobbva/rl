@@ -32,6 +32,7 @@ from utils import (
     make_offline_replay_buffer,
     parse_mission_parts,
 )
+from debug import DebugSuite
 
 torch.set_float32_matmul_precision("high")
 
@@ -200,13 +201,16 @@ def main(cfg):  # noqa: F821
     # Create agent
     model, explore_policy = make_discretecql_model(cfg, train_env, eval_env, device)
 
-    del train_env
+    # del train_env
 
     # Create loss
     loss_module, target_net_updater = make_discrete_loss(cfg.loss, model, device)
 
     # Create optimizers
     optimizer = make_discrete_cql_optimizer(cfg, loss_module)  # optimizer for CQL loss
+
+    debugger = DebugSuite(cfg)
+    debugger.on_start(replay_buffer, train_env, eval_env, model, loss_module)
 
     def update(data):
 
@@ -222,6 +226,7 @@ def main(cfg):  # noqa: F821
         loss.backward()
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        debugger.on_batch(i, data, model, loss_vals)
 
         # Soft update of target Q-network
         target_net_updater.step()
@@ -284,6 +289,7 @@ def main(cfg):  # noqa: F821
             data = replay_buffer.sample()
             # data = _encode_mission_twohot_inplace(data, default_open=True)
             data = _encode_mission_parts_inplace(data)  # instead of two-hot
+            debugger.on_batch(i, data, model)
 
         with timeit("update"):
             torch.compiler.cudagraph_mark_step_begin()
@@ -305,9 +311,11 @@ def main(cfg):  # noqa: F821
                         max_steps=eval_steps,
                         policy=explore_policy,
                         auto_cast_to_device=True,
+                        break_when_any_done=True,
                     )
                     eval_env.apply(dump_video)
 
+                debugger.on_eval(i, eval_td)
                 # eval_td: matrix of shape: [num_episodes, max_steps, ...]
                 eval_reward = (
                     eval_td["next", "reward"].sum(1).mean().item()
